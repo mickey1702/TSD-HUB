@@ -1,12 +1,10 @@
 import os
 import json
 import telebot
-import traceback
 import threading
 import time
 from queue import Queue
 from flask import Flask, request
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -57,6 +55,7 @@ user_sessions = load_sessions()
 # ==============================
 
 def main_panel():
+    from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("🚀 Autoforward Setup", callback_data="autoforward"),
@@ -79,11 +78,10 @@ def worker(route):
 
     while True:
         msg = q.get()
-
         try:
             time.sleep(route.get("delay", 0))
 
-            if route["dest_topic"]:
+            if route["dest_topic"] is not None:
                 bot.copy_message(
                     route["dest_chat"],
                     msg.chat.id,
@@ -140,7 +138,7 @@ def cb(call):
                 f"{i}.\n"
                 f"SRC: {r['source_chat']} | {r['source_topic']}\n"
                 f"DST: {r['dest_chat']} | {r['dest_topic']}\n"
-                f"Delay: {r['delay']}\n\n"
+                f"Delay: {r['delay']} sec\n\n"
             )
         bot.send_message(call.message.chat.id, txt)
 
@@ -171,13 +169,14 @@ def handle_session(m):
     s = user_sessions[uid]
 
     try:
+        # AUTOFORWARD SETUP
         if s["mode"] == "af1":
             s["src"] = int(m.text)
             s["mode"] = "af2"
             bot.reply_to(m, "Source topic or none")
 
         elif s["mode"] == "af2":
-            s["src_t"] = None if m.text == "none" else int(m.text)
+            s["src_t"] = None if m.text.lower() == "none" else int(m.text)
             s["mode"] = "af3"
             bot.reply_to(m, "Destination chat")
 
@@ -187,9 +186,9 @@ def handle_session(m):
             bot.reply_to(m, "Destination topic or none")
 
         elif s["mode"] == "af4":
-            s["dst_t"] = None if m.text == "none" else int(m.text)
+            s["dst_t"] = None if m.text.lower() == "none" else int(m.text)
             s["mode"] = "af5"
-            bot.reply_to(m, "Delay")
+            bot.reply_to(m, "Delay seconds")
 
         elif s["mode"] == "af5":
             delay = int(m.text)
@@ -212,13 +211,34 @@ def handle_session(m):
             del user_sessions[uid]
             save_sessions()
 
+        # BATCH FILE COLLECTION
         elif s["mode"] == "batch":
             user_batches[uid].append(m)
             bot.reply_to(m, f"Added ({len(user_batches[uid])})")
 
+        # BATCH DESTINATION
+        elif s["mode"] == "batch_dest":
+            dest = int(m.text)
+            batch = user_batches.get(uid, [])
+
+            bot.reply_to(m, f"Sending {len(batch)} files...")
+
+            for msg in batch:
+                try:
+                    bot.copy_message(dest, msg.chat.id, msg.message_id)
+                except Exception as e:
+                    print("Batch error:", e)
+
+            bot.reply_to(m, "✅ Batch completed")
+
+            user_batches.pop(uid, None)
+            user_sessions.pop(uid, None)
+            save_sessions()
+
     except Exception as e:
         bot.reply_to(m, f"Error: {e}")
         user_sessions.pop(uid, None)
+        save_sessions()
 
     return True
 
@@ -229,30 +249,18 @@ def handle_session(m):
 @bot.message_handler(commands=['done'])
 def done(m):
     uid = m.from_user.id
-    batch = user_batches.get(uid, [])
 
-    if not batch:
+    if uid not in user_batches or not user_batches[uid]:
         bot.reply_to(m, "No files")
         return
 
-    bot.reply_to(m, f"Processing {len(batch)} files")
-
-    DEST = batch[0].chat.id  # temp (we upgrade next)
-
-    for msg in batch:
-        try:
-            bot.copy_message(DEST, msg.chat.id, msg.message_id)
-        except Exception as e:
-            print(e)
-
-    bot.reply_to(m, "Done")
-
-    user_batches.pop(uid, None)
-    user_sessions.pop(uid, None)
+    user_sessions[uid] = {"mode": "batch_dest"}
     save_sessions()
 
+    bot.reply_to(m, "Send DESTINATION CHAT ID")
+
 # ==============================
-# RELAY
+# RELAY ENGINE
 # ==============================
 
 @bot.message_handler(func=lambda m: True, content_types=['text','photo','video','document'])
@@ -270,8 +278,9 @@ def handler(m):
         if src != r["source_chat"]:
             continue
 
-        if r["source_topic"] and topic != r["source_topic"]:
-            continue
+        if r["source_topic"] is not None:
+            if topic != r["source_topic"]:
+                continue
 
         ensure_worker(r)
         route_queues[get_key(r)].put(m)
