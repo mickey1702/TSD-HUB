@@ -83,12 +83,12 @@ def ensure_worker(route):
         t.start()
         route_workers[key] = t
 
-# 🔥 IMPORTANT: restart workers
+# 🔥 IMPORTANT: restart workers after deploy
 for r in ROUTES:
     ensure_worker(r)
 
 # ==============================
-# UI
+# UI PANEL
 # ==============================
 
 def main_panel():
@@ -108,10 +108,10 @@ def main_panel():
 
 @bot.message_handler(commands=['start'])
 def start(m):
-    bot.send_message(m.chat.id, "TSD HUB v1.4", reply_markup=main_panel())
+    bot.send_message(m.chat.id, "TSD HUB v1.5", reply_markup=main_panel())
 
 # ==============================
-# CALLBACK
+# CALLBACKS
 # ==============================
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -132,9 +132,14 @@ def cb(call):
             bot.send_message(call.message.chat.id, "No routes")
             return
 
-        txt = "📡 ROUTES\n\n"
+        txt = "📡 ROUTES:\n\n"
         for i, r in enumerate(ROUTES, 1):
-            txt += f"{i}. {r['source_chat']} → {r['dest_chat']}\n"
+            txt += (
+                f"{i}.\n"
+                f"SRC: {r['source_chat']} | {r['source_topic']}\n"
+                f"DST: {r['dest_chat']} | {r['dest_topic']}\n"
+                f"Delay: {r['delay']}\n\n"
+            )
         bot.send_message(call.message.chat.id, txt)
 
     elif call.data == "clear":
@@ -143,7 +148,7 @@ def cb(call):
         bot.send_message(call.message.chat.id, "All routes cleared")
 
 # ==============================
-# SESSION
+# SESSION HANDLER
 # ==============================
 
 def handle_session(m):
@@ -174,7 +179,7 @@ def handle_session(m):
         elif s["mode"] == "af4":
             s["dst_t"] = None if m.text.lower() == "none" else int(m.text)
             s["mode"] = "af5"
-            bot.reply_to(m, "Delay")
+            bot.reply_to(m, "Delay seconds")
 
         elif s["mode"] == "af5":
             route = {
@@ -190,15 +195,14 @@ def handle_session(m):
             save_routes()
             ensure_worker(route)
 
-            bot.reply_to(m, "✅ Autoforward ON")
+            bot.reply_to(m, "✅ Autoforward Activated")
             user_sessions.pop(uid)
 
-        # BATCH COLLECT
+        # BATCH MODE
         elif s["mode"] == "batch":
             user_batches[uid].append(m)
             bot.reply_to(m, f"Added {len(user_batches[uid])}")
 
-        # SORT SELECT
         elif s["mode"] == "batch_sort":
             batch = user_batches[uid]
 
@@ -215,24 +219,22 @@ def handle_session(m):
             s["mode"] = "batch_dest"
             bot.reply_to(m, "Send DEST CHAT ID")
 
-        # DEST
         elif s["mode"] == "batch_dest":
             s["dest"] = int(m.text)
             s["mode"] = "batch_topic"
             bot.reply_to(m, "Send TOPIC or none")
 
-        # SEND
         elif s["mode"] == "batch_topic":
             dest_topic = None if m.text.lower() == "none" else int(m.text)
             dest = s["dest"]
 
             for msg in user_batches[uid]:
-                if dest_topic:
+                if dest_topic is not None:
                     bot.copy_message(dest, msg.chat.id, msg.message_id, message_thread_id=dest_topic)
                 else:
                     bot.copy_message(dest, msg.chat.id, msg.message_id)
 
-            bot.reply_to(m, "✅ Batch Done")
+            bot.reply_to(m, "✅ Batch Completed")
 
             user_batches.pop(uid)
             user_sessions.pop(uid)
@@ -250,21 +252,23 @@ def handle_session(m):
 @bot.message_handler(commands=['list'])
 def list_cmd(m):
     uid = m.from_user.id
+    batch = user_batches.get(uid, [])
 
-    if uid not in user_batches:
-        bot.reply_to(m, "No batch")
+    if not batch:
+        bot.reply_to(m, "No files in batch")
         return
 
-    txt = "📂 ORDER:\n\n"
+    txt = "📂 FILE ORDER:\n\n"
 
-    for i, msg in enumerate(user_batches[uid], 1):
+    for i, msg in enumerate(batch, 1):
         name = "file"
+
         if msg.caption:
             name = msg.caption
         elif msg.document and msg.document.file_name:
             name = msg.document.file_name
 
-        txt += f"{i}. {name[:30]}\n"
+        txt += f"{i}. {name[:40]}\n"
 
     bot.reply_to(m, txt)
 
@@ -276,15 +280,15 @@ def list_cmd(m):
 def done(m):
     uid = m.from_user.id
 
-    if uid not in user_batches:
+    if uid not in user_batches or not user_batches[uid]:
         bot.reply_to(m, "No files")
         return
 
     user_sessions[uid] = {"mode": "batch_sort"}
-    bot.reply_to(m, "1 = normal\n2 = alphabetical")
+    bot.reply_to(m, "Choose:\n1 = Normal\n2 = Alphabetical")
 
 # ==============================
-# RELAY
+# RELAY ENGINE (FINAL FIX)
 # ==============================
 
 @bot.message_handler(func=lambda m: True, content_types=['text','photo','video','document'])
@@ -295,17 +299,27 @@ def handler(m):
     src = m.chat.id
     topic = getattr(m, "message_thread_id", None)
 
+    print("RECEIVED:", src, topic)
+
     for r in ROUTES:
+
+        if not r.get("enabled", True):
+            continue
+
         if src != r["source_chat"]:
             continue
 
-        if r["source_topic"] not in [None, topic]:
-            continue
+        # ✅ FIXED TOPIC LOGIC
+        if r["source_topic"] is not None:
+            if topic != r["source_topic"]:
+                continue
+
+        print("MATCHED ROUTE:", r)
 
         ensure_worker(r)
         route_queues[get_key(r)].put(m)
 
-# 🔥 CRITICAL FIX (CHANNEL SUPPORT)
+# 🔥 CRITICAL FOR CHANNELS
 
 @bot.channel_post_handler(content_types=['text','photo','video','document'])
 def channel_handler(m):
