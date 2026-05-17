@@ -208,7 +208,7 @@ def handle_session(m):
 
             bot.reply_to(m, "✅ Route created")
 
-            del user_sessions[uid]
+            user_sessions.pop(uid)
             save_sessions()
 
         # BATCH FILE COLLECTION
@@ -216,16 +216,36 @@ def handle_session(m):
             user_batches[uid].append(m)
             bot.reply_to(m, f"Added ({len(user_batches[uid])})")
 
-        # BATCH DESTINATION
-        elif s["mode"] == "batch_dest":
-            dest = int(m.text)
+        # BATCH DESTINATION STEP 1
+        elif s["mode"] == "batch_dest_chat":
+            s["dest"] = int(m.text)
+            s["mode"] = "batch_dest_topic"
+            bot.reply_to(m, "Send DESTINATION TOPIC ID or type none")
+
+        # BATCH DESTINATION STEP 2
+        elif s["mode"] == "batch_dest_topic":
+            dest_topic = None if m.text.lower() == "none" else int(m.text)
+            dest = s["dest"]
+
             batch = user_batches.get(uid, [])
 
             bot.reply_to(m, f"Sending {len(batch)} files...")
 
             for msg in batch:
                 try:
-                    bot.copy_message(dest, msg.chat.id, msg.message_id)
+                    if dest_topic is not None:
+                        bot.copy_message(
+                            dest,
+                            msg.chat.id,
+                            msg.message_id,
+                            message_thread_id=dest_topic
+                        )
+                    else:
+                        bot.copy_message(
+                            dest,
+                            msg.chat.id,
+                            msg.message_id
+                        )
                 except Exception as e:
                     print("Batch error:", e)
 
@@ -254,13 +274,13 @@ def done(m):
         bot.reply_to(m, "No files")
         return
 
-    user_sessions[uid] = {"mode": "batch_dest"}
+    user_sessions[uid] = {"mode": "batch_dest_chat"}
     save_sessions()
 
     bot.reply_to(m, "Send DESTINATION CHAT ID")
 
 # ==============================
-# RELAY ENGINE
+# RELAY ENGINE (FIXED)
 # ==============================
 
 @bot.message_handler(func=lambda m: True, content_types=['text','photo','video','document'])
@@ -278,9 +298,9 @@ def handler(m):
         if src != r["source_chat"]:
             continue
 
-        if r["source_topic"] is not None:
-            if topic != r["source_topic"]:
-                continue
+        # 🔥 FIXED TOPIC MATCH
+        if r["source_topic"] not in [None, topic]:
+            continue
 
         ensure_worker(r)
         route_queues[get_key(r)].put(m)
