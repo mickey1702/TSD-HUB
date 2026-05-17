@@ -50,6 +50,21 @@ def save_sessions():
 ROUTES = load_routes()
 user_sessions = load_sessions()
 
+# 🔥 IMPORTANT: restart workers for saved routes
+for r in ROUTES:
+    def init_worker(route):
+        key = f"{route['source_chat']}_{route['source_topic']}_{route['dest_chat']}_{route['dest_topic']}"
+        if key not in route_queues:
+            route_queues[key] = Queue()
+        if key not in route_workers:
+            t = threading.Thread(target=worker, args=(route,), daemon=True)
+            t.start()
+            route_workers[key] = t
+    try:
+        init_worker(r)
+    except:
+        pass
+
 # ==============================
 # UI PANEL
 # ==============================
@@ -58,10 +73,10 @@ def main_panel():
     from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🚀 Autoforward Setup", callback_data="autoforward"),
+        InlineKeyboardButton("🚀 Start Autoforward", callback_data="autoforward"),
+        InlineKeyboardButton("🧠 Start Batch Mode", callback_data="batch"),
         InlineKeyboardButton("📡 View Routes", callback_data="viewroutes"),
-        InlineKeyboardButton("🧠 Batch Mode", callback_data="batch"),
-        InlineKeyboardButton("📊 Stats", callback_data="stats")
+        InlineKeyboardButton("🗑 Clear Routes", callback_data="clearroutes")
     )
     return kb
 
@@ -142,19 +157,21 @@ def cb(call):
             )
         bot.send_message(call.message.chat.id, txt)
 
+    elif call.data == "clearroutes":
+        ROUTES.clear()
+        save_routes()
+        bot.send_message(call.message.chat.id, "🗑 All routes cleared")
+
     elif call.data == "autoforward":
         user_sessions[uid] = {"mode": "af1"}
         save_sessions()
-        bot.send_message(call.message.chat.id, "Send SOURCE CHAT ID")
+        bot.send_message(call.message.chat.id, "🚀 Autoforward Mode Started\nSend SOURCE CHAT ID")
 
     elif call.data == "batch":
         user_batches[uid] = []
         user_sessions[uid] = {"mode": "batch"}
         save_sessions()
-        bot.send_message(call.message.chat.id, "Send files, then /done")
-
-    elif call.data == "stats":
-        bot.send_message(call.message.chat.id, f"Routes: {len(ROUTES)}")
+        bot.send_message(call.message.chat.id, "🧠 Batch Mode Started\nSend files, then /done")
 
 # ==============================
 # SESSION HANDLER
@@ -191,14 +208,12 @@ def handle_session(m):
             bot.reply_to(m, "Delay seconds")
 
         elif s["mode"] == "af5":
-            delay = int(m.text)
-
             route = {
                 "source_chat": s["src"],
                 "source_topic": s["src_t"],
                 "dest_chat": s["dst"],
                 "dest_topic": s["dst_t"],
-                "delay": delay,
+                "delay": int(m.text),
                 "enabled": True
             }
 
@@ -206,24 +221,31 @@ def handle_session(m):
             save_routes()
             ensure_worker(route)
 
-            bot.reply_to(m, "✅ Route created")
+            bot.reply_to(m, "✅ Autoforward Activated")
 
             user_sessions.pop(uid)
             save_sessions()
 
-        # BATCH FILE COLLECTION
+        # BATCH MODE
         elif s["mode"] == "batch":
             user_batches[uid].append(m)
             bot.reply_to(m, f"Added ({len(user_batches[uid])})")
 
-        # BATCH DESTINATION STEP 1
-        elif s["mode"] == "batch_dest_chat":
-            s["dest"] = int(m.text)
-            s["mode"] = "batch_dest_topic"
-            bot.reply_to(m, "Send DESTINATION TOPIC ID or type none")
+        elif s["mode"] == "batch_sort":
+            batch = user_batches[uid]
 
-        # BATCH DESTINATION STEP 2
-        elif s["mode"] == "batch_dest_topic":
+            if m.text == "2":
+                batch.sort(key=lambda x: (x.caption or "").lower())
+
+            s["mode"] = "batch_dest"
+            bot.reply_to(m, "Send DESTINATION CHAT ID")
+
+        elif s["mode"] == "batch_dest":
+            s["dest"] = int(m.text)
+            s["mode"] = "batch_topic"
+            bot.reply_to(m, "Send DESTINATION TOPIC or none")
+
+        elif s["mode"] == "batch_topic":
             dest_topic = None if m.text.lower() == "none" else int(m.text)
             dest = s["dest"]
 
@@ -233,23 +255,14 @@ def handle_session(m):
 
             for msg in batch:
                 try:
-                    if dest_topic is not None:
-                        bot.copy_message(
-                            dest,
-                            msg.chat.id,
-                            msg.message_id,
-                            message_thread_id=dest_topic
-                        )
+                    if dest_topic:
+                        bot.copy_message(dest, msg.chat.id, msg.message_id, message_thread_id=dest_topic)
                     else:
-                        bot.copy_message(
-                            dest,
-                            msg.chat.id,
-                            msg.message_id
-                        )
+                        bot.copy_message(dest, msg.chat.id, msg.message_id)
                 except Exception as e:
-                    print("Batch error:", e)
+                    print(e)
 
-            bot.reply_to(m, "✅ Batch completed")
+            bot.reply_to(m, "✅ Batch Completed")
 
             user_batches.pop(uid, None)
             user_sessions.pop(uid, None)
@@ -263,7 +276,7 @@ def handle_session(m):
     return True
 
 # ==============================
-# DONE COMMAND
+# DONE
 # ==============================
 
 @bot.message_handler(commands=['done'])
@@ -274,10 +287,10 @@ def done(m):
         bot.reply_to(m, "No files")
         return
 
-    user_sessions[uid] = {"mode": "batch_dest_chat"}
+    user_sessions[uid] = {"mode": "batch_sort"}
     save_sessions()
 
-    bot.reply_to(m, "Send DESTINATION CHAT ID")
+    bot.reply_to(m, "Choose order:\n1 = As Uploaded\n2 = Alphabetical")
 
 # ==============================
 # RELAY ENGINE (FIXED)
@@ -292,13 +305,9 @@ def handler(m):
     topic = getattr(m, "message_thread_id", None)
 
     for r in ROUTES:
-        if not r.get("enabled", True):
-            continue
-
         if src != r["source_chat"]:
             continue
 
-        # 🔥 FIXED TOPIC MATCH
         if r["source_topic"] not in [None, topic]:
             continue
 
