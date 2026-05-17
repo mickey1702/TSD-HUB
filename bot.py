@@ -39,6 +39,23 @@ def save_routes():
 ROUTES = load_routes()
 
 # ==============================
+# CAPTION ENGINE
+# ==============================
+
+def process_caption(text, route):
+    if not text:
+        return text
+
+    for k, v in route.get("replace", {}).items():
+        text = text.replace(k, v)
+
+    for w in route.get("clean_words", []):
+        text = text.replace(w, "")
+
+    text = f"{route.get('prefix','')}{text}{route.get('suffix','')}"
+    return text
+
+# ==============================
 # WORKER ENGINE
 # ==============================
 
@@ -54,19 +71,36 @@ def worker(route):
         try:
             time.sleep(route.get("delay", 0))
 
-            if route["dest_topic"] is not None:
-                bot.copy_message(
-                    route["dest_chat"],
-                    msg.chat.id,
-                    msg.message_id,
-                    message_thread_id=route["dest_topic"]
-                )
+            caption = ""
+
+            if hasattr(msg, "caption") and msg.caption:
+                caption = process_caption(msg.caption, route)
+
+            elif hasattr(msg, "text") and msg.text:
+                caption = process_caption(msg.text, route)
+
+            if msg.content_type == "text":
+                if route["dest_topic"]:
+                    bot.send_message(route["dest_chat"], caption, message_thread_id=route["dest_topic"])
+                else:
+                    bot.send_message(route["dest_chat"], caption)
+
             else:
-                bot.copy_message(
-                    route["dest_chat"],
-                    msg.chat.id,
-                    msg.message_id
-                )
+                if route["dest_topic"]:
+                    bot.copy_message(
+                        route["dest_chat"],
+                        msg.chat.id,
+                        msg.message_id,
+                        message_thread_id=route["dest_topic"],
+                        caption=caption if caption else None
+                    )
+                else:
+                    bot.copy_message(
+                        route["dest_chat"],
+                        msg.chat.id,
+                        msg.message_id,
+                        caption=caption if caption else None
+                    )
 
         except Exception as e:
             print("Worker error:", e)
@@ -84,12 +118,11 @@ def ensure_worker(route):
         t.start()
         route_workers[key] = t
 
-# restart workers on boot
 for r in ROUTES:
     ensure_worker(r)
 
 # ==============================
-# MENU UI
+# MENU
 # ==============================
 
 def main_menu():
@@ -103,7 +136,7 @@ def main_menu():
     return kb
 
 # ==============================
-# START + HELP
+# START / HELP
 # ==============================
 
 @bot.message_handler(commands=['start'])
@@ -112,25 +145,24 @@ def start(m):
 
 @bot.message_handler(commands=['help'])
 def help_cmd(m):
-    txt = """
-📘 TSD HUB COMMANDS
+    bot.reply_to(m, """
+📘 COMMANDS
 
-🚀 AUTOFORWARD:
-/addroute → start setup
+/addroute → create route  
+/routes → view routes  
+/delroute 1 → delete route  
 
-📡 ROUTES:
-/routes → view routes
-/delroute 1 → delete specific route
+/setprefix 1 TEXT  
+/setsuffix 1 TEXT  
+/replace 1 old new  
+/clean 1 word  
 
-🧠 BATCH:
-/done → finish upload
-/list → view order
+Batch:
+/done  
+/list  
 
-⚙️ NOTES:
-• Bot must be admin in source & destination
-• Works for channels & groups
-"""
-    bot.reply_to(m, txt)
+⚙️ Bot must be admin in source & destination
+""")
 
 # ==============================
 # CALLBACKS
@@ -151,12 +183,7 @@ def cb(call):
 
         txt = "📡 ROUTES:\n\n"
         for i, r in enumerate(ROUTES, 1):
-            txt += (
-                f"{i}.\n"
-                f"SRC: {r['source_chat']} | {r['source_topic']}\n"
-                f"DST: {r['dest_chat']} | {r['dest_topic']}\n"
-                f"Delay: {r['delay']}\n\n"
-            )
+            txt += f"{i}. {r['source_chat']} → {r['dest_chat']}\n"
         bot.send_message(call.message.chat.id, txt)
 
     elif call.data == "batch":
@@ -165,7 +192,7 @@ def cb(call):
         bot.send_message(call.message.chat.id, "Send files then /done")
 
     elif call.data == "delroute":
-        bot.send_message(call.message.chat.id, "Use:\n/delroute 1")
+        bot.send_message(call.message.chat.id, "Use /delroute 1")
 
 # ==============================
 # SESSION HANDLER
@@ -184,7 +211,6 @@ def handle_session(m):
     s = user_sessions[uid]
 
     try:
-        # AUTOFORWARD SETUP
         if s["mode"] == "af1":
             s["src"] = int(m.text)
             s["mode"] = "af2"
@@ -212,7 +238,11 @@ def handle_session(m):
                 "dest_chat": s["dst"],
                 "dest_topic": s["dst_t"],
                 "delay": int(m.text),
-                "enabled": True
+                "enabled": True,
+                "prefix": "",
+                "suffix": "",
+                "replace": {},
+                "clean_words": []
             }
 
             ROUTES.append(route)
@@ -222,23 +252,14 @@ def handle_session(m):
             bot.reply_to(m, "✅ Autoforward Activated")
             user_sessions.pop(uid)
 
-        # BATCH MODE
         elif s["mode"] == "batch":
             user_batches[uid].append(m)
-            bot.reply_to(m, f"Added {len(user_batches[uid])}")
 
         elif s["mode"] == "batch_sort":
             batch = user_batches[uid]
 
             if m.text == "2":
-                def get_name(msg):
-                    if msg.caption:
-                        return msg.caption.lower()
-                    if msg.document and msg.document.file_name:
-                        return msg.document.file_name.lower()
-                    return str(msg.message_id)
-
-                batch.sort(key=get_name)
+                batch.sort(key=lambda x: (x.caption or "").lower())
 
             s["mode"] = "batch_dest"
             bot.reply_to(m, "Send DEST CHAT ID")
@@ -249,12 +270,12 @@ def handle_session(m):
             bot.reply_to(m, "Send TOPIC or none")
 
         elif s["mode"] == "batch_topic":
-            dest_topic = None if m.text.lower() == "none" else int(m.text)
+            topic = None if m.text.lower() == "none" else int(m.text)
             dest = s["dest"]
 
             for msg in user_batches[uid]:
-                if dest_topic is not None:
-                    bot.copy_message(dest, msg.chat.id, msg.message_id, message_thread_id=dest_topic)
+                if topic:
+                    bot.copy_message(dest, msg.chat.id, msg.message_id, message_thread_id=topic)
                 else:
                     bot.copy_message(dest, msg.chat.id, msg.message_id)
 
@@ -279,82 +300,83 @@ def addroute(m):
     bot.reply_to(m, "Send SOURCE CHAT ID")
 
 @bot.message_handler(commands=['routes'])
-def show_routes(m):
+def routes_cmd(m):
     if not ROUTES:
-        bot.reply_to(m, "No routes available")
+        bot.reply_to(m, "No routes")
         return
 
-    txt = "📡 ROUTES:\n\n"
-
+    txt = ""
     for i, r in enumerate(ROUTES, 1):
-        txt += (
-            f"{i}.\n"
-            f"SRC: {r['source_chat']} | {r['source_topic']}\n"
-            f"DST: {r['dest_chat']} | {r['dest_topic']}\n"
-            f"Delay: {r['delay']}\n\n"
-        )
-
+        txt += f"{i}. {r['source_chat']} → {r['dest_chat']}\n"
     bot.reply_to(m, txt)
 
 @bot.message_handler(commands=['delroute'])
-def delete_route(m):
+def delroute(m):
     try:
         num = int(m.text.split()[1]) - 1
-
-        if 0 <= num < len(ROUTES):
-            ROUTES.pop(num)
-            save_routes()
-            bot.reply_to(m, "✅ Route deleted")
-        else:
-            bot.reply_to(m, "Invalid route number")
-
+        ROUTES.pop(num)
+        save_routes()
+        bot.reply_to(m, "Deleted")
     except:
-        bot.reply_to(m, "Usage:\n/delroute 1")
+        bot.reply_to(m, "Usage /delroute 1")
+
+# ==============================
+# CAPTION COMMANDS
+# ==============================
+
+@bot.message_handler(commands=['setprefix'])
+def setprefix(m):
+    parts = m.text.split()
+    ROUTES[int(parts[1])-1]["prefix"] = " ".join(parts[2:])
+    save_routes()
+    bot.reply_to(m, "Prefix set")
+
+@bot.message_handler(commands=['setsuffix'])
+def setsuffix(m):
+    parts = m.text.split()
+    ROUTES[int(parts[1])-1]["suffix"] = " ".join(parts[2:])
+    save_routes()
+    bot.reply_to(m, "Suffix set")
+
+@bot.message_handler(commands=['replace'])
+def replace_cmd(m):
+    parts = m.text.split()
+    ROUTES[int(parts[1])-1]["replace"][parts[2]] = parts[3]
+    save_routes()
+    bot.reply_to(m, "Replace added")
+
+@bot.message_handler(commands=['clean'])
+def clean_cmd(m):
+    parts = m.text.split()
+    ROUTES[int(parts[1])-1]["clean_words"].append(parts[2])
+    save_routes()
+    bot.reply_to(m, "Clean word added")
+
+# ==============================
+# BATCH COMMANDS
+# ==============================
 
 @bot.message_handler(commands=['done'])
 def done(m):
-    uid = m.from_user.id
-
-    if uid not in user_batches or not user_batches[uid]:
-        bot.reply_to(m, "No files")
-        return
-
-    user_sessions[uid] = {"mode": "batch_sort"}
-    bot.reply_to(m, "Choose:\n1 = Normal\n2 = Alphabetical")
+    user_sessions[m.from_user.id] = {"mode": "batch_sort"}
+    bot.reply_to(m, "1 Normal\n2 Alphabetical")
 
 @bot.message_handler(commands=['list'])
 def list_cmd(m):
-    uid = m.from_user.id
-    batch = user_batches.get(uid, [])
-
-    if not batch:
-        bot.reply_to(m, "No files in batch")
-        return
-
-    txt = "📂 FILE ORDER:\n\n"
-
+    batch = user_batches.get(m.from_user.id, [])
+    txt = ""
     for i, msg in enumerate(batch, 1):
-        name = "file"
-
-        if msg.caption:
-            name = msg.caption
-        elif msg.document and msg.document.file_name:
-            name = msg.document.file_name
-
-        txt += f"{i}. {name[:40]}\n"
-
-    bot.reply_to(m, txt)
+        txt += f"{i}. {msg.caption or 'file'}\n"
+    bot.reply_to(m, txt or "Empty")
 
 # ==============================
-# RELAY ENGINE
+# RELAY
 # ==============================
 
 def process_relay(m):
 
     src = m.chat.id
     topic = getattr(m, "message_thread_id", None)
-
-    print("RECEIVED:", src, topic)
 
     for r in ROUTES:
 
@@ -364,18 +386,11 @@ def process_relay(m):
         if src != r["source_chat"]:
             continue
 
-        if r["source_topic"] is not None:
-            if topic != r["source_topic"]:
-                continue
-
-        print("MATCHED:", r)
+        if r["source_topic"] is not None and topic != r["source_topic"]:
+            continue
 
         ensure_worker(r)
         route_queues[get_key(r)].put(m)
-
-# ==============================
-# HANDLERS
-# ==============================
 
 @bot.message_handler(func=lambda m: True, content_types=['text','photo','video','document'])
 def handler(m):
