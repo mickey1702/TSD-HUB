@@ -3,33 +3,31 @@ import json
 import telebot
 import threading
 import time
-import re
 from queue import Queue
 from flask import Flask, request
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=False)
 app = Flask(__name__)
 
-ROUTE_FILE = "routes.json"
+ROUTE_FILE    = "routes.json"
 SETTINGS_FILE = "user_settings.json"
 
-ROUTES = []
+ROUTES        = []
 user_sessions = {}
-user_batches = {}
-route_queues = {}
+user_batches  = {}
+route_queues  = {}
 route_workers = {}
-user_settings = {}  # per-user settings
+user_settings = {}
 
-# ==============================
+# ══════════════════════════════════════════════════════
 # LOAD / SAVE
-# ==============================
+# ══════════════════════════════════════════════════════
 
 def load_routes():
     try:
-        with open(ROUTE_FILE, "r") as f:
+        with open(ROUTE_FILE) as f:
             return json.load(f)
     except:
         return []
@@ -40,7 +38,7 @@ def save_routes():
 
 def load_settings():
     try:
-        with open(SETTINGS_FILE, "r") as f:
+        with open(SETTINGS_FILE) as f:
             return json.load(f)
     except:
         return {}
@@ -49,180 +47,156 @@ def save_settings():
     with open(SETTINGS_FILE, "w") as f:
         json.dump(user_settings, f, indent=4)
 
-ROUTES = load_routes()
+ROUTES        = load_routes()
 user_settings = load_settings()
 
+DEFAULT_ORDER = ["prefix_suffix", "replace", "template", "caption", "thumbnail"]
+
 def get_user_settings(uid):
-    uid = str(uid)
-    if uid not in user_settings:
-        user_settings[uid] = {
-            "prefix": "",
-            "suffix": "",
-            "rename_template": "",       # e.g. "SarcasticDr {filename}"
-            "caption": "",               # custom caption template
-            "thumbnail_file_id": None,   # stored Telegram file_id
-            "send_as_document": False,
-            "replace_words": {},         # {"old": "new", ...}
-            "destination": None,         # default dest chat id
-            "dest_topic": None,
+    key = str(uid)
+    if key not in user_settings:
+        user_settings[key] = {
+            "prefix":            "",
+            "suffix":            "",
+            "rename_template":   "",
+            "caption":           "",
+            "thumbnail_file_id": None,
+            "send_as_document":  False,
+            "replace_words":     {},
+            "destination":       None,
+            "dest_topic":        None,
+            # processing order — list of step keys
+            "order": DEFAULT_ORDER.copy(),
         }
         save_settings()
-    return user_settings[uid]
+    # back-fill order if missing (existing users)
+    if "order" not in user_settings[key]:
+        user_settings[key]["order"] = DEFAULT_ORDER.copy()
+        save_settings()
+    return user_settings[key]
 
-# ==============================
-# WORKER ENGINE
-# ==============================
+# ══════════════════════════════════════════════════════
+# PROCESSING PIPELINE
+# Order is driven by s["order"] — fully user-defined.
+# ══════════════════════════════════════════════════════
 
-def get_key(r):
-    return f"{r['source_chat']}_{r['source_topic']}_{r['dest_chat']}_{r['dest_topic']}"
+def run_pipeline(uid, filename, original_caption):
+    """
+    Returns (new_filename, new_caption) after applying
+    all steps in the user-defined order.
+    Thumbnail is handled separately at upload time.
+    """
+    s            = get_user_settings(uid)
+    name, ext    = os.path.splitext(filename)
+    cur_filename = filename
+    cur_caption  = original_caption or ""
 
-def worker(route):
-    key = get_key(route)
-    q = route_queues[key]
-    while True:
-        msg = q.get()
-        try:
-            time.sleep(route.get("delay", 0))
-            if route["dest_topic"] is not None:
-                bot.copy_message(route["dest_chat"], msg.chat.id, msg.message_id,
-                                 message_thread_id=route["dest_topic"])
-            else:
-                bot.copy_message(route["dest_chat"], msg.chat.id, msg.message_id)
-        except Exception as e:
-            print("Worker error:", e)
-        q.task_done()
+    for step in s.get("order", DEFAULT_ORDER):
 
-def ensure_worker(route):
-    key = get_key(route)
-    if key not in route_queues:
-        route_queues[key] = Queue()
-    if key not in route_workers:
-        t = threading.Thread(target=worker, args=(route,), daemon=True)
-        t.start()
-        route_workers[key] = t
+        if step == "prefix_suffix":
+            n, e = os.path.splitext(cur_filename)
+            if s["prefix"]:
+                n = s["prefix"] + n
+            if s["suffix"]:
+                n = n + s["suffix"]
+            cur_filename = n + e
 
-for r in ROUTES:
-    ensure_worker(r)
+        elif step == "replace":
+            for old, new in s.get("replace_words", {}).items():
+                cur_filename = cur_filename.replace(old, new)
+                cur_caption  = cur_caption.replace(old, new)
 
-# ==============================
-# FILE PROCESSING HELPERS
-# ==============================
+        elif step == "template":
+            if s["rename_template"]:
+                n, e = os.path.splitext(cur_filename)
+                new_name = (s["rename_template"]
+                            .replace("{filename}", n)
+                            .replace("{original}", name))
+                cur_filename = new_name + e
 
-def apply_rename(filename, uid):
-    s = get_user_settings(uid)
+        elif step == "caption":
+            if s["caption"]:
+                cur_caption = (s["caption"]
+                               .replace("{filename}", cur_filename)
+                               .replace("{original}", original_caption or ""))
 
-    # Apply replace/remove words first
-    for old, new in s.get("replace_words", {}).items():
-        filename = filename.replace(old, new)
+        # "thumbnail" step is a marker only — applied during upload
 
-    # Apply template if set
-    if s["rename_template"]:
-        # Strip extension for template use
-        name, ext = os.path.splitext(filename)
-        filename = s["rename_template"].replace("{filename}", name).replace("{original}", name)
-        filename = filename + ext
+    return cur_filename, cur_caption
 
-    # Apply prefix/suffix (around name, preserve extension)
-    name, ext = os.path.splitext(filename)
-    if s["prefix"]:
-        name = s["prefix"] + name
-    if s["suffix"]:
-        name = name + s["suffix"]
-
-    return name + ext
-
-def apply_caption(original_caption, filename, uid):
-    s = get_user_settings(uid)
-    if s["caption"]:
-        cap = s["caption"]
-        cap = cap.replace("{filename}", filename)
-        cap = cap.replace("{original}", original_caption or "")
-        return cap
-    return original_caption
 
 def send_processed_file(uid, msg, dest_chat, dest_topic=None):
     """
-    Download, rename, re-upload with custom caption + thumbnail.
-    Handles document, photo, video.
+    Full pipeline: download → rename → caption → thumbnail → upload.
+    Falls back to plain copy for unsupported types.
     """
-    s = get_user_settings(uid)
-
+    s            = get_user_settings(uid)
     content_type = msg.content_type
-    original_caption = msg.caption or ""
+    orig_caption = msg.caption or ""
 
-    # ---- Determine file info ----
-    file_id = None
+    # ── resolve file ─────────────────────────────────
+    file_id           = None
     original_filename = "file"
-    mime_type = None
 
     if content_type == "document":
-        file_id = msg.document.file_id
+        file_id           = msg.document.file_id
         original_filename = msg.document.file_name or "file"
-        mime_type = msg.document.mime_type
     elif content_type == "video":
-        file_id = msg.video.file_id
+        file_id           = msg.video.file_id
         original_filename = f"video_{msg.video.file_unique_id}.mp4"
-        mime_type = "video/mp4"
     elif content_type == "photo":
-        file_id = msg.photo[-1].file_id
+        file_id           = msg.photo[-1].file_id
         original_filename = f"photo_{msg.photo[-1].file_unique_id}.jpg"
-        mime_type = "image/jpeg"
     else:
-        # Unsupported type — just copy
-        if dest_topic:
-            bot.copy_message(dest_chat, msg.chat.id, msg.message_id, message_thread_id=dest_topic)
-        else:
-            bot.copy_message(dest_chat, msg.chat.id, msg.message_id)
+        _copy(dest_chat, msg, dest_topic)
         return
 
-    new_filename = apply_rename(original_filename, uid)
-    new_caption = apply_caption(original_caption, new_filename, uid)
+    new_filename, new_caption = run_pipeline(uid, original_filename, orig_caption)
 
-    # ---- Download file ----
+    # ── download ─────────────────────────────────────
     file_info = bot.get_file(file_id)
-    downloaded = bot.download_file(file_info.file_path)
-    tmp_path = f"/tmp/{new_filename}"
+    raw       = bot.download_file(file_info.file_path)
+    tmp_path  = f"/tmp/tsd_{new_filename}"
     with open(tmp_path, "wb") as f:
-        f.write(downloaded)
+        f.write(raw)
 
-    # ---- Thumbnail ----
+    # ── thumbnail (only if step is in order) ─────────
     thumb = None
-    if s["thumbnail_file_id"]:
+    if "thumbnail" in s.get("order", DEFAULT_ORDER) and s["thumbnail_file_id"]:
         try:
-            thumb_info = bot.get_file(s["thumbnail_file_id"])
-            thumb_bytes = bot.download_file(thumb_info.file_path)
-            thumb_path = "/tmp/thumb.jpg"
-            with open(thumb_path, "wb") as tf:
-                tf.write(thumb_bytes)
-            thumb = open(thumb_path, "rb")
-        except:
+            ti   = bot.get_file(s["thumbnail_file_id"])
+            tb   = bot.download_file(ti.file_path)
+            tp   = "/tmp/_tsd_thumb.jpg"
+            with open(tp, "wb") as tf:
+                tf.write(tb)
+            thumb = open(tp, "rb")
+        except Exception as e:
+            print("Thumb error:", e)
             thumb = None
 
-    # ---- Upload ----
+    # ── upload ───────────────────────────────────────
     try:
         with open(tmp_path, "rb") as f:
-            kwargs = dict(
-                chat_id=dest_chat,
-                caption=new_caption or None,
-                parse_mode="HTML"
-            )
+            kw = dict(chat_id=dest_chat,
+                      caption=new_caption or None,
+                      parse_mode="HTML")
             if dest_topic:
-                kwargs["message_thread_id"] = dest_topic
+                kw["message_thread_id"] = dest_topic
 
             if s["send_as_document"] or content_type == "document":
-                kwargs["document"] = f
-                kwargs["visible_file_name"] = new_filename
+                kw["document"]          = f
+                kw["visible_file_name"] = new_filename
                 if thumb:
-                    kwargs["thumb"] = thumb
-                bot.send_document(**kwargs)
+                    kw["thumb"] = thumb
+                bot.send_document(**kw)
             elif content_type == "video":
-                kwargs["video"] = f
+                kw["video"] = f
                 if thumb:
-                    kwargs["thumb"] = thumb
-                bot.send_video(**kwargs)
+                    kw["thumb"] = thumb
+                bot.send_video(**kw)
             elif content_type == "photo":
-                kwargs["photo"] = f
-                bot.send_photo(**kwargs)
+                kw["photo"] = f
+                bot.send_photo(**kw)
     except Exception as e:
         print("Upload error:", e)
         raise
@@ -234,158 +208,314 @@ def send_processed_file(uid, msg, dest_chat, dest_topic=None):
         except:
             pass
 
-# ==============================
+
+def _copy(dest_chat, msg, dest_topic=None):
+    if dest_topic:
+        bot.copy_message(dest_chat, msg.chat.id, msg.message_id,
+                         message_thread_id=dest_topic)
+    else:
+        bot.copy_message(dest_chat, msg.chat.id, msg.message_id)
+
+
+# ══════════════════════════════════════════════════════
+# ROUTE WORKER ENGINE
+# Each route stores owner_uid + list of destinations.
+# ══════════════════════════════════════════════════════
+
+def get_key(r):
+    return f"{r['source_chat']}_{r['source_topic']}"
+
+def worker(route):
+    key = get_key(route)
+    q   = route_queues[key]
+    while True:
+        msg = q.get()
+        try:
+            time.sleep(route.get("delay", 0))
+            owner_uid = route.get("owner_uid")
+            for dest in route.get("destinations", []):
+                dest_chat  = dest["chat_id"]
+                dest_topic = dest.get("topic_id")
+                try:
+                    if owner_uid:
+                        send_processed_file(owner_uid, msg, dest_chat, dest_topic)
+                    else:
+                        _copy(dest_chat, msg, dest_topic)
+                except Exception as e:
+                    print(f"Worker dest error ({dest_chat}):", e)
+        except Exception as e:
+            print("Worker error:", e)
+        q.task_done()
+
+def ensure_worker(route):
+    key = get_key(route)
+    if key not in route_queues:
+        route_queues[key] = Queue()
+    if key not in route_workers or not route_workers[key].is_alive():
+        t = threading.Thread(target=worker, args=(route,), daemon=True)
+        t.start()
+        route_workers[key] = t
+
+for r in ROUTES:
+    ensure_worker(r)
+
+# ══════════════════════════════════════════════════════
+# ORDER LABELS
+# ══════════════════════════════════════════════════════
+
+ORDER_LABELS = {
+    "prefix_suffix": "✏️ Prefix/Suffix",
+    "replace":       "🔁 Replace/Remove",
+    "template":      "📝 Rename Template",
+    "caption":       "💬 Caption",
+    "thumbnail":     "🖼 Thumbnail",
+}
+
+def order_display(uid):
+    s = get_user_settings(uid)
+    lines = []
+    for i, step in enumerate(s["order"], 1):
+        lines.append(f"{i}. {ORDER_LABELS.get(step, step)}")
+    return "\n".join(lines)
+
+# ══════════════════════════════════════════════════════
 # MENUS
-# ==============================
+# ══════════════════════════════════════════════════════
 
 def main_menu():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🚀 Autoforward", callback_data="af"),
-        InlineKeyboardButton("📡 Routes", callback_data="routes"),
-        InlineKeyboardButton("🧠 Batch Mode", callback_data="batch"),
-        InlineKeyboardButton("❌ Delete Route", callback_data="delroute"),
-        InlineKeyboardButton("⚙️ File Settings", callback_data="settings"),
-        InlineKeyboardButton("🖼 Set Thumbnail", callback_data="set_thumb"),
+        InlineKeyboardButton("🚀 Add Route",       callback_data="af"),
+        InlineKeyboardButton("📡 View Routes",     callback_data="routes"),
+        InlineKeyboardButton("🧠 Batch Forward",   callback_data="batch"),
+        InlineKeyboardButton("❌ Delete Route",    callback_data="delroute"),
+        InlineKeyboardButton("⚙️ File Settings",   callback_data="settings"),
+        InlineKeyboardButton("🖼 Thumbnail",        callback_data="thumb_menu"),
+        InlineKeyboardButton("🔢 Set Order",        callback_data="set_order"),
+        InlineKeyboardButton("📋 My Settings",     callback_data="view_settings"),
     )
     return kb
 
 def settings_menu(uid):
-    s = get_user_settings(uid)
+    s      = get_user_settings(uid)
+    doc_lbl = "📄 As Document: ✅" if s["send_as_document"] else "📄 As Document: ❌"
     kb = InlineKeyboardMarkup(row_width=2)
-    doc_label = "📄 Send As Doc: ON ✅" if s["send_as_document"] else "📄 Send As Doc: OFF"
     kb.add(
-        InlineKeyboardButton("✏️ Set Prefix", callback_data="set_prefix"),
-        InlineKeyboardButton("✏️ Set Suffix", callback_data="set_suffix"),
+        InlineKeyboardButton("✏️ Prefix",          callback_data="set_prefix"),
+        InlineKeyboardButton("✏️ Suffix",          callback_data="set_suffix"),
         InlineKeyboardButton("📝 Rename Template", callback_data="set_template"),
-        InlineKeyboardButton("💬 Set Caption", callback_data="set_caption"),
-        InlineKeyboardButton("🔁 Replace Words", callback_data="set_replace"),
-        InlineKeyboardButton("🗑 Remove Word", callback_data="set_remove"),
-        InlineKeyboardButton(doc_label, callback_data="toggle_doc"),
+        InlineKeyboardButton("💬 Caption",         callback_data="set_caption"),
+        InlineKeyboardButton("🔁 Replace Word",    callback_data="set_replace"),
+        InlineKeyboardButton("🗑 Remove Word",     callback_data="set_remove"),
+        InlineKeyboardButton(doc_lbl,              callback_data="toggle_doc"),
         InlineKeyboardButton("📤 Set Destination", callback_data="set_dest"),
-        InlineKeyboardButton("📋 View Settings", callback_data="view_settings"),
-        InlineKeyboardButton("🔄 Reset Settings", callback_data="reset_settings"),
-        InlineKeyboardButton("🔙 Back", callback_data="back_main"),
+        InlineKeyboardButton("🔄 Reset All",       callback_data="reset_settings"),
+        InlineKeyboardButton("🔙 Back",            callback_data="back_main"),
     )
     return kb
 
-# ==============================
-# START + HELP
-# ==============================
+def thumb_menu(uid):
+    s  = get_user_settings(uid)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("👁 View Thumbnail",   callback_data="thumb_view"),
+        InlineKeyboardButton("📷 Set Thumbnail",    callback_data="thumb_set"),
+        InlineKeyboardButton("🗑 Remove Thumbnail", callback_data="thumb_remove"),
+        InlineKeyboardButton("🔙 Back",             callback_data="back_main"),
+    )
+    return kb
 
-@bot.message_handler(commands=['start'])
+def route_add_menu():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("📝 Step-by-step",              callback_data="af_steps"),
+        InlineKeyboardButton("⚡ All-in-one (quick entry)",  callback_data="af_quick"),
+        InlineKeyboardButton("🔙 Back",                      callback_data="back_main"),
+    )
+    return kb
+
+# ══════════════════════════════════════════════════════
+# /start  /help
+# ══════════════════════════════════════════════════════
+
+@bot.message_handler(commands=["start"])
 def start(m):
-    bot.send_message(m.chat.id,
-        "⚡ <b>TSD HUB READY</b>\n\nSend any file to process it, or use the menu below.",
-        reply_markup=main_menu())
+    bot.send_message(
+        m.chat.id,
+        "⚡ <b>TSD HUB READY</b>\n\n"
+        "Send any file directly → it gets processed and forwarded.\n"
+        "Use the menu for routes, batch, and settings.",
+        reply_markup=main_menu()
+    )
 
-@bot.message_handler(commands=['help'])
+@bot.message_handler(commands=["help"])
 def help_cmd(m):
-    txt = """
-📘 <b>TSD HUB COMMANDS</b>
+    bot.reply_to(m, """
+📘 <b>TSD HUB — FULL GUIDE</b>
 
-🚀 <b>AUTOFORWARD:</b>
-/addroute → setup auto-forward route
+━━━━━━━━━━━━━━━━━━
+🖼 <b>THUMBNAIL</b>
+/setthumb       → send photo to set
+/removethumb    → clear thumbnail
+(View via menu → Thumbnail)
 
-📡 <b>ROUTES:</b>
-/routes → view all routes
-/delroute 1 → delete route by number
+━━━━━━━━━━━━━━━━━━
+✏️ <b>RENAME</b>
+/prefix  TSD_              → add prefix
+/suffix  _HD               → add suffix
+/template SarcasticDr_{filename}
 
-🖼 <b>THUMBNAIL:</b>
-/setthumb → send photo after this to set thumbnail
-/removethumb → remove saved thumbnail
+🔁 <b>REPLACE / REMOVE</b>
+/replace 480p|1080p        → replace in name & caption
+/remove  [TSD]             → remove from name & caption
 
-✏️ <b>RENAME:</b>
-/prefix Text_ → set prefix
-/suffix _Text → set suffix
-/template SarcasticDr_{filename} → rename template
-/replace old|new → replace word in filename
-/remove word → remove word from filename
+💬 <b>CAPTION</b>
+/caption 📚 <b>{filename}</b>
+/removecaption
+Variables: {filename} {original}
 
-💬 <b>CAPTION:</b>
-/caption 📚 {filename} → set caption template
-/removecaption → clear caption
+━━━━━━━━━━━━━━━━━━
+🔢 <b>PROCESSING ORDER</b>
+/setorder → set order via menu
+Default: Prefix/Suffix → Replace → Template → Caption → Thumbnail
 
-📤 <b>DESTINATION:</b>
-/setdest -100xxxxxxxxx → set default dest chat
-/setdesttopic 123 → set dest topic id
+━━━━━━━━━━━━━━━━━━
+📤 <b>DESTINATION</b>
+/setdest              → step-by-step (chat + topic)
+/setdesttopic 123     → update topic only (0 to clear)
 
-🧠 <b>BATCH:</b>
-/done → finish batch upload
+━━━━━━━━━━━━━━━━━━
+🚀 <b>AUTOFORWARD ROUTES</b>
+/addroute             → step-by-step OR quick entry
+  Step-by-step: guides you through each field
+  Quick entry:  SOURCE_ID | SOURCE_TOPIC | DEST1_ID:DEST1_TOPIC,DEST2_ID:DEST2_TOPIC | DELAY
+  (use 0 for no topic, e.g.  -1001111 | 0 | -1002222:0,-1003333:5 | 0)
+/routes               → list all routes
+/delroute 1           → delete by number
 
-⚙️ <b>NOTES:</b>
-• Bot must be admin in source & destination
-• {filename} = new filename, {original} = original caption
-"""
-    bot.reply_to(m, txt)
+━━━━━━━━━━━━━━━━━━
+🧠 <b>BATCH FORWARD</b>
+Send files → /done → choose sort → enter destination
+All settings (rename/caption/thumb) applied to every file.
 
-# ==============================
+⚙️ /settings   → view all current settings
+""")
+
+# ══════════════════════════════════════════════════════
 # CALLBACKS
-# ==============================
+# ══════════════════════════════════════════════════════
 
 @bot.callback_query_handler(func=lambda c: True)
 def cb(call):
     uid = call.from_user.id
     cid = call.message.chat.id
 
+    # ── main menu ──────────────────────────────────
     if call.data == "af":
-        user_sessions[uid] = {"mode": "af1"}
-        bot.send_message(cid, "📥 Send <b>SOURCE CHAT ID</b>")
+        bot.send_message(cid, "🚀 <b>Add Route</b>\nChoose setup method:",
+                         reply_markup=route_add_menu())
+
+    elif call.data == "af_steps":
+        user_sessions[uid] = {"mode": "af_s1"}
+        bot.send_message(cid,
+            "📝 <b>Step-by-step Route Setup</b>\n\n"
+            "<b>Step 1/5</b> — Send <b>SOURCE chat ID</b>:")
+
+    elif call.data == "af_quick":
+        user_sessions[uid] = {"mode": "af_quick"}
+        bot.send_message(cid,
+            "⚡ <b>Quick Route Entry</b>\n\n"
+            "Send one line in this format:\n"
+            "<code>SOURCE_ID | SOURCE_TOPIC | DEST1_ID:TOPIC,DEST2_ID:TOPIC | DELAY</code>\n\n"
+            "Examples:\n"
+            "<code>-1001111111 | 0 | -1002222222:0 | 0</code>\n"
+            "<code>-1001111111 | 5 | -1002222222:0,-1003333333:8 | 3</code>\n\n"
+            "Use <code>0</code> for no topic.")
 
     elif call.data == "routes":
-        if not ROUTES:
-            bot.send_message(cid, "No routes configured.")
-            return
-        txt = "📡 <b>ROUTES:</b>\n\n"
-        for i, r in enumerate(ROUTES, 1):
-            txt += (f"{i}.\nSRC: <code>{r['source_chat']}</code> | topic: {r['source_topic']}\n"
-                    f"DST: <code>{r['dest_chat']}</code> | topic: {r['dest_topic']}\n"
-                    f"Delay: {r['delay']}s\n\n")
-        bot.send_message(cid, txt)
+        _show_routes(cid)
 
     elif call.data == "batch":
         user_batches[uid] = []
         user_sessions[uid] = {"mode": "batch"}
-        bot.send_message(cid, "📦 Batch mode ON. Send files then /done")
+        bot.send_message(cid,
+            "🧠 <b>Batch Forward ON</b>\n"
+            "Send all your files, then send /done")
 
     elif call.data == "delroute":
-        bot.send_message(cid, "Use: /delroute 1")
+        bot.send_message(cid, "Use: <code>/delroute 1</code>")
 
     elif call.data == "settings":
-        bot.send_message(cid, "⚙️ <b>File Settings</b>", reply_markup=settings_menu(uid))
+        bot.send_message(cid, "⚙️ <b>File Settings</b>",
+                         reply_markup=settings_menu(uid))
 
-    elif call.data == "set_thumb":
+    elif call.data == "thumb_menu":
+        bot.send_message(cid, "🖼 <b>Thumbnail Settings</b>",
+                         reply_markup=thumb_menu(uid))
+
+    elif call.data == "thumb_view":
+        s = get_user_settings(uid)
+        if s["thumbnail_file_id"]:
+            bot.send_photo(cid, s["thumbnail_file_id"],
+                           caption="🖼 Your current thumbnail.")
+        else:
+            bot.send_message(cid, "❌ No thumbnail set.")
+
+    elif call.data == "thumb_set":
         user_sessions[uid] = {"mode": "await_thumb"}
-        bot.send_message(cid, "🖼 Send me a <b>photo</b> to use as thumbnail.")
+        bot.send_message(cid, "📷 Send a <b>photo</b> to use as thumbnail:")
 
+    elif call.data == "thumb_remove":
+        get_user_settings(uid)["thumbnail_file_id"] = None
+        save_settings()
+        bot.answer_callback_query(call.id, "✅ Thumbnail removed.")
+        bot.send_message(cid, "✅ Thumbnail removed.")
+
+    elif call.data == "set_order":
+        _ask_order(cid, uid)
+
+    elif call.data == "view_settings":
+        _send_settings(cid, uid)
+
+    # ── settings menu ──────────────────────────────
     elif call.data == "set_prefix":
         user_sessions[uid] = {"mode": "await_prefix"}
-        bot.send_message(cid, "✏️ Send the <b>prefix</b> text (e.g. <code>TSD_</code>)\nSend <code>none</code> to clear.")
+        bot.send_message(cid,
+            "✏️ Send <b>prefix</b> (e.g. <code>TSD_</code>)\n"
+            "Send <code>none</code> to clear:")
 
     elif call.data == "set_suffix":
         user_sessions[uid] = {"mode": "await_suffix"}
-        bot.send_message(cid, "✏️ Send the <b>suffix</b> text (e.g. <code>_HD</code>)\nSend <code>none</code> to clear.")
+        bot.send_message(cid,
+            "✏️ Send <b>suffix</b> (e.g. <code>_HD</code>)\n"
+            "Send <code>none</code> to clear:")
 
     elif call.data == "set_template":
         user_sessions[uid] = {"mode": "await_template"}
         bot.send_message(cid,
-            "📝 Send rename template.\nUse <code>{filename}</code> as placeholder.\n"
-            "Example: <code>SarcasticDr_{filename}</code>\nSend <code>none</code> to clear.")
+            "📝 Send <b>rename template</b>\n"
+            "Use <code>{filename}</code> as placeholder\n"
+            "Example: <code>SarcasticDr_{filename}</code>\n"
+            "Send <code>none</code> to clear:")
 
     elif call.data == "set_caption":
         user_sessions[uid] = {"mode": "await_caption"}
         bot.send_message(cid,
-            "💬 Send caption template.\nVariables:\n"
-            "<code>{filename}</code> = new filename\n<code>{original}</code> = original caption\n"
-            "Example: <code>📚 <b>{filename}</b></code>\nSend <code>none</code> to clear.")
+            "💬 Send <b>caption template</b>\n"
+            "<code>{filename}</code> = new filename\n"
+            "<code>{original}</code> = original caption\n"
+            "Example: <code>📚 <b>{filename}</b></code>\n"
+            "Send <code>none</code> to clear:")
 
     elif call.data == "set_replace":
         user_sessions[uid] = {"mode": "await_replace"}
-        bot.send_message(cid, "🔁 Send: <code>old word|new word</code>\nExample: <code>480p|1080p</code>")
+        bot.send_message(cid,
+            "🔁 Format: <code>old|new</code>\n"
+            "Example: <code>480p|1080p</code>")
 
     elif call.data == "set_remove":
         user_sessions[uid] = {"mode": "await_remove"}
-        bot.send_message(cid, "🗑 Send the word to <b>remove</b> from filenames/captions.\nExample: <code>[TSD]</code>")
+        bot.send_message(cid, "🗑 Send the word to <b>remove</b> from filenames/captions:")
 
     elif call.data == "toggle_doc":
         s = get_user_settings(uid)
@@ -393,33 +523,21 @@ def cb(call):
         save_settings()
         status = "ON ✅" if s["send_as_document"] else "OFF ❌"
         bot.answer_callback_query(call.id, f"Send As Document: {status}")
-        bot.edit_message_reply_markup(cid, call.message.message_id, reply_markup=settings_menu(uid))
+        try:
+            bot.edit_message_reply_markup(cid, call.message.message_id,
+                                          reply_markup=settings_menu(uid))
+        except:
+            pass
 
     elif call.data == "set_dest":
-        user_sessions[uid] = {"mode": "await_dest"}
-        bot.send_message(cid, "📤 Send <b>destination chat ID</b>\nExample: <code>-1001234567890</code>")
-
-    elif call.data == "view_settings":
-        s = get_user_settings(uid)
-        rw = "\n".join([f"  <code>{k}</code> → <code>{v}</code>" for k, v in s["replace_words"].items()]) or "  None"
-        txt = (
-            f"⚙️ <b>Your Settings:</b>\n\n"
-            f"Prefix: <code>{s['prefix'] or 'None'}</code>\n"
-            f"Suffix: <code>{s['suffix'] or 'None'}</code>\n"
-            f"Template: <code>{s['rename_template'] or 'None'}</code>\n"
-            f"Caption: <code>{s['caption'] or 'None'}</code>\n"
-            f"Thumbnail: {'✅ Set' if s['thumbnail_file_id'] else '❌ Not set'}\n"
-            f"Send As Doc: {'✅' if s['send_as_document'] else '❌'}\n"
-            f"Destination: <code>{s['destination'] or 'Not set'}</code>\n"
-            f"Dest Topic: <code>{s['dest_topic'] or 'None'}</code>\n"
-            f"Replace Words:\n{rw}"
-        )
-        bot.send_message(cid, txt)
+        user_sessions[uid] = {"mode": "await_dest_chat"}
+        bot.send_message(cid,
+            "📤 <b>Step 1/2</b> — Send destination <b>chat ID</b>\n"
+            "Example: <code>-1001234567890</code>")
 
     elif call.data == "reset_settings":
-        uid_str = str(uid)
-        user_settings[uid_str] = {}
-        get_user_settings(uid)  # reinit defaults
+        user_settings.pop(str(uid), None)
+        get_user_settings(uid)
         save_settings()
         bot.answer_callback_query(call.id, "✅ Settings reset!")
         bot.send_message(cid, "✅ All settings reset to default.")
