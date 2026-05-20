@@ -16,7 +16,6 @@ ROUTE_FILE = "routes.json"
 
 ROUTES = []
 user_sessions = {}
-user_batches = {}
 
 route_queues = {}
 route_workers = {}
@@ -39,7 +38,7 @@ def save_routes():
 ROUTES = load_routes()
 
 # ==============================
-# TEXT ENGINE
+# TEXT PROCESSING
 # ==============================
 
 def process_text(text, route):
@@ -56,15 +55,7 @@ def process_text(text, route):
     return text
 
 # ==============================
-# RENAME ENGINE
-# ==============================
-
-def apply_template(filename, route):
-    template = route.get("template", "{filename}")
-    return template.replace("{filename}", filename)
-
-# ==============================
-# WORKER (AUTOFORWARD CORE)
+# WORKER
 # ==============================
 
 def get_key(r):
@@ -79,31 +70,10 @@ def worker(route):
         try:
             time.sleep(route.get("delay", 0))
 
-            caption = None
-            filename = None
+            caption = process_text(msg.caption or msg.text, route)
 
-            # PROCESS
-            if route["mode"] == "caption":
-                caption = process_text(msg.caption or msg.text, route)
-
-            elif route["mode"] == "filename" and msg.document:
-                filename = process_text(msg.document.file_name, route)
-                filename = apply_template(filename, route)
-
-            # SEND
             if msg.content_type == "text":
                 bot.send_message(route["dest_chat"], caption or msg.text)
-
-            elif msg.document:
-                file = bot.get_file(msg.document.file_id)
-                data = bot.download_file(file.file_path)
-
-                bot.send_document(
-                    route["dest_chat"],
-                    data,
-                    visible_file_name=filename or msg.document.file_name,
-                    caption=caption or msg.caption
-                )
 
             else:
                 bot.copy_message(
@@ -111,7 +81,7 @@ def worker(route):
                     msg.chat.id,
                     msg.message_id,
                     message_thread_id=route["dest_topic"],
-                    caption=caption
+                    caption=caption if caption else None
                 )
 
         except Exception as e:
@@ -141,7 +111,6 @@ def main_menu():
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("➕ Add Route", callback_data="add"))
     kb.add(InlineKeyboardButton("📡 Routes", callback_data="routes"))
-    kb.add(InlineKeyboardButton("🧠 Batch", callback_data="batch"))
     return kb
 
 def routes_menu():
@@ -149,35 +118,6 @@ def routes_menu():
     for i in range(len(ROUTES)):
         kb.add(InlineKeyboardButton(f"Route {i+1}", callback_data=f"r_{i}"))
     kb.add(InlineKeyboardButton("⬅️ Back", callback_data="main"))
-    return kb
-
-def route_panel(i):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("⚙️ Processing", callback_data=f"p_{i}"),
-        InlineKeyboardButton("🖼 Thumbnail", callback_data=f"thumb_{i}")
-    )
-    kb.add(
-        InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{i}"),
-        InlineKeyboardButton("🗑 Delete", callback_data=f"del_{i}")
-    )
-    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="routes"))
-    return kb
-
-def processing_panel(i):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🔁 Replace", callback_data=f"rep_{i}"),
-        InlineKeyboardButton("❌ Remove", callback_data=f"cln_{i}")
-    )
-    kb.add(
-        InlineKeyboardButton("✏️ Prefix", callback_data=f"pre_{i}"),
-        InlineKeyboardButton("🔚 Suffix", callback_data=f"suf_{i}")
-    )
-    kb.add(
-        InlineKeyboardButton("⚙️ Mode", callback_data=f"mode_{i}")
-    )
-    kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"r_{i}"))
     return kb
 
 # ==============================
@@ -189,71 +129,29 @@ def start(m):
     bot.send_message(m.chat.id, "⚡ TSD HUB READY", reply_markup=main_menu())
 
 # ==============================
+# ADD ROUTE COMMAND (SAFE)
+# ==============================
+
+@bot.message_handler(commands=['addroute'])
+def addroute_cmd(m):
+    user_sessions[m.from_user.id] = {"mode": "add"}
+    bot.reply_to(m, "Paste full route:\n/addroute src src_topic dest dest_topic delay")
+
+# ==============================
 # CALLBACK
 # ==============================
 
 @bot.callback_query_handler(func=lambda c: True)
 def cb(call):
-    uid = call.from_user.id
-    d = call.data
 
-    if d == "main":
-        bot.edit_message_text("Main Menu", call.message.chat.id, call.message.message_id, reply_markup=main_menu())
+    if call.data == "routes":
+        bot.edit_message_text("📡 ROUTES", call.message.chat.id, call.message.message_id, reply_markup=routes_menu())
 
-    elif d == "routes":
-        bot.edit_message_text("Routes", call.message.chat.id, call.message.message_id, reply_markup=routes_menu())
-
-    elif d == "add":
-        user_sessions[uid] = {"mode": "add"}
-        bot.send_message(call.message.chat.id, "Send:\n/addroute src src_topic dest dest_topic delay")
-
-    elif d.startswith("r_"):
-        i = int(d.split("_")[1])
-        bot.edit_message_text(f"Route {i+1}", call.message.chat.id, call.message.message_id, reply_markup=route_panel(i))
-
-    elif d.startswith("del_"):
-        i = int(d.split("_")[1])
-        ROUTES.pop(i)
-        save_routes()
-        bot.answer_callback_query(call.id, "Deleted")
-
-    elif d.startswith("p_"):
-        i = int(d.split("_")[1])
-        bot.edit_message_text("Processing", call.message.chat.id, call.message.message_id, reply_markup=processing_panel(i))
-
-    elif d.startswith("mode_"):
-        i = int(d.split("_")[1])
-        ROUTES[i]["mode"] = "filename" if ROUTES[i]["mode"] == "caption" else "caption"
-        save_routes()
-        bot.answer_callback_query(call.id, ROUTES[i]["mode"])
-
-    elif d.startswith("pre_"):
-        user_sessions[uid] = {"mode": "prefix", "r": int(d.split("_")[1])}
-        bot.send_message(call.message.chat.id, "Send prefix")
-
-    elif d.startswith("suf_"):
-        user_sessions[uid] = {"mode": "suffix", "r": int(d.split("_")[1])}
-        bot.send_message(call.message.chat.id, "Send suffix")
-
-    elif d.startswith("rep_"):
-        user_sessions[uid] = {"mode": "replace", "r": int(d.split("_")[1])}
-        bot.send_message(call.message.chat.id, "Send old new")
-
-    elif d.startswith("cln_"):
-        user_sessions[uid] = {"mode": "clean", "r": int(d.split("_")[1])}
-        bot.send_message(call.message.chat.id, "Send word")
-
-    elif d.startswith("rename_"):
-        user_sessions[uid] = {"mode": "template", "r": int(d.split("_")[1])}
-        bot.send_message(call.message.chat.id, "Send template like:\n{filename}_TSD")
-
-    elif d == "batch":
-        user_batches[uid] = []
-        user_sessions[uid] = {"mode": "batch"}
-        bot.send_message(call.message.chat.id, "Send files then /done")
+    elif call.data == "main":
+        bot.edit_message_text("MAIN MENU", call.message.chat.id, call.message.message_id, reply_markup=main_menu())
 
 # ==============================
-# MESSAGE HANDLER
+# MAIN HANDLER
 # ==============================
 
 @bot.message_handler(func=lambda m: True, content_types=['text','photo','video','document'])
@@ -261,18 +159,20 @@ def handler(m):
 
     uid = m.from_user.id
 
-    # SESSION
+    # ================= SESSION =================
     if uid in user_sessions:
+
         s = user_sessions[uid]
 
         try:
             if s["mode"] == "add":
+
                 parts = m.text.split()
 
                 src = int(parts[1])
-                src_t = None if parts[2]=="none" else int(parts[2])
+                src_t = None if parts[2].lower() == "none" else int(parts[2])
                 dst = int(parts[3])
-                dst_t = None if parts[4]=="none" else int(parts[4])
+                dst_t = None if parts[4].lower() == "none" else int(parts[4])
                 delay = int(parts[5])
 
                 route = {
@@ -285,69 +185,43 @@ def handler(m):
                     "prefix": "",
                     "suffix": "",
                     "replace": {},
-                    "clean_words": [],
-                    "template": "{filename}",
-                    "thumbnail": None
+                    "clean_words": []
                 }
 
                 ROUTES.append(route)
                 save_routes()
                 ensure_worker(route)
 
-                bot.reply_to(m, "Route Added")
+                bot.reply_to(m, "✅ Route Added")
                 user_sessions.pop(uid)
-
-            elif s["mode"] == "prefix":
-                ROUTES[s["r"]]["prefix"] = m.text
-
-            elif s["mode"] == "suffix":
-                ROUTES[s["r"]]["suffix"] = m.text
-
-            elif s["mode"] == "replace":
-                a,b = m.text.split()
-                ROUTES[s["r"]]["replace"][a] = b
-
-            elif s["mode"] == "clean":
-                ROUTES[s["r"]]["clean_words"].append(m.text)
-
-            elif s["mode"] == "template":
-                ROUTES[s["r"]]["template"] = m.text
-
-            elif s["mode"] == "batch":
-                user_batches[uid].append(m)
-
-            save_routes()
-            bot.reply_to(m, "Saved")
-            user_sessions.pop(uid)
 
         except Exception as e:
             bot.reply_to(m, f"Error: {e}")
             user_sessions.pop(uid)
 
+        return  # IMPORTANT: stop here
+
+    # ================= AUTOFORWARD =================
+
+    # ❌ Ignore commands
+    if m.text and m.text.startswith("/"):
         return
 
-    # AUTOFORWARD ENGINE
+    # ❌ Ignore bot messages
+    if m.from_user and m.from_user.is_bot:
+        return
+
     for r in ROUTES:
-        if m.chat.id == r["source_chat"]:
-            if r["source_topic"] is None or getattr(m, "message_thread_id", None) == r["source_topic"]:
-                ensure_worker(r)
-                route_queues[get_key(r)].put(m)
 
-# ==============================
-# BATCH COMMANDS
-# ==============================
+        if m.chat.id != r["source_chat"]:
+            continue
 
-@bot.message_handler(commands=['done'])
-def done(m):
-    uid = m.from_user.id
-    bot.send_message(m.chat.id, "Send destination chat ID")
-    user_sessions[uid] = {"mode": "batch_send"}
+        if r["source_topic"] is not None:
+            if getattr(m, "message_thread_id", None) != r["source_topic"]:
+                continue
 
-@bot.message_handler(commands=['list'])
-def list_cmd(m):
-    batch = user_batches.get(m.from_user.id, [])
-    txt = "\n".join([f"{i+1}. {x.caption or 'file'}" for i,x in enumerate(batch)])
-    bot.reply_to(m, txt or "Empty")
+        ensure_worker(r)
+        route_queues[get_key(r)].put(m)
 
 # ==============================
 # WEBHOOK
