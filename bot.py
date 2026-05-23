@@ -519,13 +519,17 @@ def handle_session(m):
                 f"⏳ Sending <b>{total}</b> file(s)…\n"
                 f"Settings applied:\n{order_display(s(uid))}")
 
-            failed = 0
+            failed      = 0
+            first_error = None
             for file_msg in batch:
                 try:
                     send_processed_file(bot, s(uid), file_msg, dest, dest_topic)
                 except Exception as e:
-                    print("Batch error:", e)
+                    import traceback
+                    traceback.print_exc()
                     failed += 1
+                    if first_error is None:
+                        first_error = str(e)
                     try:
                         _plain_copy(bot, dest, file_msg, dest_topic)
                     except:
@@ -534,6 +538,8 @@ def handle_session(m):
             result = f"✅ Batch done! {total - failed}/{total} fully processed."
             if failed:
                 result += f"\n⚠️ {failed} fell back to plain copy."
+            if first_error:
+                result += f"\n\n🔍 First error:\n<code>{first_error}</code>"
             bot.reply_to(m, result)
             user_batches.pop(uid, None)
             user_sessions.pop(uid); save_sess()
