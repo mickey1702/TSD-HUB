@@ -1,20 +1,13 @@
 import os
+import traceback
 from config import DEFAULT_ORDER
 
 # ══════════════════════════════════════════
 # PIPELINE
-# Applies all steps in user-defined order.
-# Returns (new_filename, new_caption).
-# "thumbnail" is a marker only — handled at upload.
 # ══════════════════════════════════════════
 
 def run_pipeline(s, filename, original_caption):
-    """
-    s               : user settings dict
-    filename        : original filename string
-    original_caption: original caption string or ""
-    """
-    orig_name    = os.path.splitext(filename)[0]   # for {original} placeholder
+    orig_name    = os.path.splitext(filename)[0]
     cur_filename = filename
     cur_caption  = original_caption or ""
 
@@ -48,24 +41,44 @@ def run_pipeline(s, filename, original_caption):
                                .replace("{filename}", cur_filename)
                                .replace("{original}", original_caption or ""))
 
-        # "thumbnail" step: marker only, applied during upload
-
     return cur_filename, cur_caption
 
 
 # ══════════════════════════════════════════
-# UPLOAD  (download → pipeline → re-upload)
+# THUMBNAIL DOWNLOAD
+# ══════════════════════════════════════════
+
+def _get_thumb(bot, s):
+    """Download thumbnail to /tmp, return open file handle or None."""
+    if "thumbnail" not in s.get("order", DEFAULT_ORDER):
+        return None
+    if not s.get("thumbnail_file_id"):
+        return None
+    try:
+        ti = bot.get_file(s["thumbnail_file_id"])
+        tb = bot.download_file(ti.file_path)
+        tp = "/tmp/_tsd_thumb.jpg"
+        with open(tp, "wb") as tf:
+            tf.write(tb)
+        return open(tp, "rb")
+    except Exception as e:
+        print(f"[TSD] Thumb download error: {e}")
+        return None
+
+
+# ══════════════════════════════════════════
+# SEND PROCESSED FILE
 # ══════════════════════════════════════════
 
 def send_processed_file(bot, s, msg, dest_chat, dest_topic=None):
     """
     Full pipeline: download → rename → caption → thumbnail → upload.
-    Falls back to plain copy for unsupported content types.
+    Raises on error so caller can decide to fallback or report.
     """
     content_type = msg.content_type
     orig_caption = msg.caption or ""
 
-    # ── resolve file ──────────────────────
+    # ── resolve file info ─────────────────
     file_id           = None
     original_filename = "file"
 
@@ -79,62 +92,62 @@ def send_processed_file(bot, s, msg, dest_chat, dest_topic=None):
         file_id           = msg.photo[-1].file_id
         original_filename = f"photo_{msg.photo[-1].file_unique_id}.jpg"
     else:
+        # unsupported type — plain copy, no error
         _plain_copy(bot, dest_chat, msg, dest_topic)
         return
 
+    # ── run text pipeline ─────────────────
     new_filename, new_caption = run_pipeline(s, original_filename, orig_caption)
+    print(f"[TSD] Pipeline: '{original_filename}' → '{new_filename}' | caption: '{new_caption[:60]}'")
 
-    # ── download ──────────────────────────
+    # ── download file ─────────────────────
     file_info = bot.get_file(file_id)
     raw       = bot.download_file(file_info.file_path)
-    tmp_path  = f"/tmp/tsd_{new_filename}"
-    with open(tmp_path, "wb") as f:
-        f.write(raw)
+
+    # use a safe tmp name (strip path separators)
+    safe_name = new_filename.replace("/", "_").replace("\\", "_")
+    tmp_path  = f"/tmp/tsd_{safe_name}"
+
+    with open(tmp_path, "wb") as fh:
+        fh.write(raw)
 
     # ── thumbnail ─────────────────────────
-    thumb = None
-    if "thumbnail" in s.get("order", DEFAULT_ORDER) and s.get("thumbnail_file_id"):
-        try:
-            ti = bot.get_file(s["thumbnail_file_id"])
-            tb = bot.download_file(ti.file_path)
-            tp = "/tmp/_tsd_thumb.jpg"
-            with open(tp, "wb") as tf:
-                tf.write(tb)
-            thumb = open(tp, "rb")
-        except Exception as e:
-            print("Thumb error:", e)
-            thumb = None
+    thumb = _get_thumb(bot, s)
 
     # ── upload ────────────────────────────
     try:
-        with open(tmp_path, "rb") as f:
+        with open(tmp_path, "rb") as fh:
             kw = dict(
                 chat_id    = dest_chat,
-                caption    = new_caption or None,
+                caption    = new_caption if new_caption else None,
                 parse_mode = "HTML",
             )
             if dest_topic:
                 kw["message_thread_id"] = dest_topic
 
             if s.get("send_as_document") or content_type == "document":
-                kw["document"]          = f
-                kw["visible_file_name"] = new_filename
+                # For documents: pass file as InputFile tuple (bytes, filename)
+                # This is how pyTelegramBotAPI sets the filename on upload
+                kw["document"] = (new_filename, fh)
                 if thumb:
-                    kw["thumb"] = thumb
+                    kw["thumbnail"] = thumb
                 bot.send_document(**kw)
 
             elif content_type == "video":
-                kw["video"] = f
+                kw["video"] = fh
                 if thumb:
-                    kw["thumb"] = thumb
+                    kw["thumbnail"] = thumb
                 bot.send_video(**kw)
 
             elif content_type == "photo":
-                kw["photo"] = f
+                kw["photo"] = fh
                 bot.send_photo(**kw)
 
+        print(f"[TSD] Upload OK → {dest_chat} topic={dest_topic}")
+
     except Exception as e:
-        print("Upload error:", e)
+        print(f"[TSD] Upload error: {e}")
+        traceback.print_exc()
         raise
     finally:
         if thumb:
@@ -151,4 +164,4 @@ def _plain_copy(bot, dest_chat, msg, dest_topic=None):
                          message_thread_id=dest_topic)
     else:
         bot.copy_message(dest_chat, msg.chat.id, msg.message_id)
-      
+        
