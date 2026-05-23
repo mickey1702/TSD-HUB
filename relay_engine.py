@@ -1,198 +1,110 @@
 import threading
 import time
-
 from queue import Queue
+from caption_engine import send_processed_file, _plain_copy
 
-# =========================================
-# GLOBAL RUNTIME OBJECTS
-# =========================================
+# ══════════════════════════════════════════
+# RUNTIME STATE
+# ══════════════════════════════════════════
 
 recent_relays = set()
-
-route_queues = {}
+route_queues  = {}
 route_workers = {}
 
-# =========================================
-# ROUTE KEY
-# =========================================
+# ══════════════════════════════════════════
+# ROUTE KEY  (source only — one worker per source)
+# ══════════════════════════════════════════
 
 def get_route_key(route):
+    return f"{route['source_chat']}_{route.get('source_topic')}"
 
-    return (
-        f"{route['source_chat']}_"
-        f"{route['source_topic']}_"
-        f"{route['dest_chat']}_"
-        f"{route['dest_topic']}"
-    )
+# ══════════════════════════════════════════
+# WORKER
+# Runs in its own daemon thread per route.
+# Applies full pipeline to every message.
+# ══════════════════════════════════════════
 
-# =========================================
-# WORKER ENGINE
-# =========================================
-
-def route_worker(bot, route):
-
+def route_worker(bot, route, user_settings_getter):
+    """
+    bot                 : telebot.TeleBot instance
+    route               : route dict
+    user_settings_getter: callable(uid) → settings dict
+    """
     key = get_route_key(route)
-
-    q = route_queues[key]
+    q   = route_queues[key]
 
     while True:
-
-        message = q.get()
-
+        msg = q.get()
         try:
-
             delay = route.get("delay", 0)
+            if delay:
+                time.sleep(delay)
 
-            time.sleep(delay)
+            owner_uid = route.get("owner_uid")
 
-            src_chat = message.chat.id
-
-            prefix = route.get("prefix", "")
-
-            original_caption = ""
-
-            if hasattr(message, "caption") and message.caption:
-                original_caption = message.caption
-
-            elif hasattr(message, "text") and message.text:
-                original_caption = message.text
-
-            final_caption = (
-                f"{prefix}{original_caption}"
-                if prefix else original_caption
-            )
-
-            # =====================================
-            # TEXT MESSAGE
-            # =====================================
-
-            if message.content_type == "text":
-
-                if route["dest_topic"] is not None:
-
-                    sent = bot.send_message(
-                        route["dest_chat"],
-                        final_caption,
-                        message_thread_id=route["dest_topic"]
-                    )
-
-                else:
-
-                    sent = bot.send_message(
-                        route["dest_chat"],
-                        final_caption
-                    )
-
-            # =====================================
-            # MEDIA MESSAGE
-            # =====================================
-
-            else:
-
-                if route["dest_topic"] is not None:
-
-                    sent = bot.copy_message(
-                        chat_id=route["dest_chat"],
-                        from_chat_id=src_chat,
-                        message_id=message.message_id,
-                        message_thread_id=route["dest_topic"]
-                    )
-
-                else:
-
-                    sent = bot.copy_message(
-                        chat_id=route["dest_chat"],
-                        from_chat_id=src_chat,
-                        message_id=message.message_id
-                    )
-
-            recent_relays.add(
-                f"{route['dest_chat']}:"
-                f"{route['dest_topic']}:"
-                f"{sent.message_id}"
-            )
+            for dest in route.get("destinations", []):
+                dest_chat  = dest["chat_id"]
+                dest_topic = dest.get("topic_id")
+                try:
+                    if owner_uid:
+                        s = user_settings_getter(owner_uid)
+                        send_processed_file(bot, s, msg, dest_chat, dest_topic)
+                    else:
+                        _plain_copy(bot, dest_chat, msg, dest_topic)
+                except Exception as e:
+                    print(f"Worker dest error ({dest_chat}):", e)
+                    try:
+                        _plain_copy(bot, dest_chat, msg, dest_topic)
+                    except:
+                        pass
 
         except Exception as e:
-
-            print("WORKER ERROR:", e)
-
+            print("Worker error:", e)
         q.task_done()
 
-# =========================================
+# ══════════════════════════════════════════
 # ENSURE WORKER
-# =========================================
+# ══════════════════════════════════════════
 
-def ensure_worker(bot, route):
-
+def ensure_worker(bot, route, user_settings_getter):
     key = get_route_key(route)
-
     if key not in route_queues:
-
         route_queues[key] = Queue()
-
-    if key not in route_workers:
-
+    if key not in route_workers or not route_workers[key].is_alive():
         t = threading.Thread(
             target=route_worker,
-            args=(bot, route),
+            args=(bot, route, user_settings_getter),
             daemon=True
         )
-
         t.start()
-
         route_workers[key] = t
 
-# =========================================
-# RELAY PROCESSOR
-# =========================================
+# ══════════════════════════════════════════
+# PROCESS RELAY
+# Called on every incoming message/channel post.
+# Matches against all routes, queues matched ones.
+# ══════════════════════════════════════════
 
-def process_relay(bot, message, routes):
-
+def process_relay(bot, message, routes, user_settings_getter):
     global recent_relays
 
-    try:
+    src   = message.chat.id
+    topic = getattr(message, "message_thread_id", None)
 
-        src_chat = message.chat.id
+    # dedupe: skip messages that we just sent ourselves
+    sig = f"{src}:{topic}:{message.message_id}"
+    if sig in recent_relays:
+        recent_relays.discard(sig)
+        return
 
-        src_topic = getattr(
-            message,
-            "message_thread_id",
-            None
-        )
+    for route in routes:
+        if not route.get("enabled", True):
+            continue
+        if src != route["source_chat"]:
+            continue
+        if route.get("source_topic") is not None and topic != route["source_topic"]:
+            continue
 
-        signature = (
-            f"{src_chat}:"
-            f"{src_topic}:"
-            f"{message.message_id}"
-        )
-
-        if signature in recent_relays:
-            return
-
-        for route in routes:
-
-            # ROUTE DISABLED
-            if not route.get("enabled", True):
-                continue
-
-            # WRONG SOURCE CHAT
-            if src_chat != route["source_chat"]:
-                continue
-
-            # WRONG TOPIC
-            if (
-                route["source_topic"] is not None
-                and
-                src_topic != route["source_topic"]
-            ):
-                continue
-
-            ensure_worker(bot, route)
-
-            key = get_route_key(route)
-
-            route_queues[key].put(message)
-
-    except Exception as e:
-
-        print("RELAY ENGINE ERROR:", e)
+        ensure_worker(bot, route, user_settings_getter)
+        route_queues[get_route_key(route)].put(message)
+        
